@@ -1,6 +1,6 @@
 # Cardux's Motorbike Report — GUI + scraping Moto.it
-# Anno robusto senza range predefiniti, report HTML Plotly, Guida integrata,
-# cartella di default: Desktop/<modello>, credito Instagram cliccabile.
+# Fix km robusto, nessun range anni, report HTML con grafici + mappa località,
+# Guida integrata, cartella di default Desktop/<modello>, credito Instagram cliccabile.
 
 import re
 import time
@@ -12,6 +12,7 @@ from urllib.parse import urljoin
 import webbrowser
 import sys
 import os
+import json
 
 # scraping deps
 import requests
@@ -39,7 +40,7 @@ DEFAULT_HEADERS = {
     "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
-# Anni plausibili in assoluto, non legati al modello
+# Anni plausibili in assoluto
 YEAR_MIN, YEAR_MAX = 1990, 2035
 
 YEAR_PAT = re.compile(r"\b(19\d{2}|20\d{2})\b")
@@ -72,19 +73,39 @@ def parse_price(txt: str) -> Optional[int]:
         return None
 
 def parse_km(txt: str) -> Optional[int]:
-    m = re.search(r"Km\s*:?[\s\-]*([\d\. ]+)", txt, flags=re.IGNORECASE)
+    """
+    Estrae km senza trascinarsi cifre successive.
+    Casi coperti:
+      - "Km 18.526"
+      - "18.526 km"
+      - "Km: 32.600"
+    Evita di inglobare numeri di data (es. '3 luglio 2025') a seguire.
+    """
+    # 1) pattern con 'Km' etichetta: cattura SOLO blocco di cifre e punti, senza spazi interni
+    m = re.search(r"\bK[mM]\s*[:\-]?\s*([0-9][\d\.]{0,11})(?![\d\.])", txt)
+    if not m:
+        # 2) pattern "NNN km" con eventuali punti come separatore
+        m = re.search(r"\b([0-9][\d\.]{0,11})\s*[Kk][Mm]\b", txt)
     if not m:
         return None
-    raw = m.group(1).replace(".", "").replace(" ", "")
+    raw = m.group(1)
+    raw = raw.replace(".", "")
     try:
-        return int(raw)
+        val = int(raw)
+        # filtra palesi valori rumorosi (es. > 500.000 km)
+        if 0 < val < 500000:
+            return val
     except ValueError:
-        return None
+        pass
+    return None
 
 def parse_location(txt: str) -> Optional[str]:
-    m = re.search(r"([A-Za-zÀ-ÿ'’\-\s]+)\s*\([A-Z]{2}\)", txt)
+    # "Tradate (VA)" oppure "San Colombano al Lambro (MI)"
+    m = re.search(r"([A-Za-zÀ-ÿ'’\-\s]+)\s*\(([A-Z]{2})\)", txt)
     if m:
-        return text_clean(m.group(0))
+        # normalizza spazi
+        loc = f"{text_clean(m.group(1))} ({m.group(2)})"
+        return loc
     return None
 
 def has_listings(soup: BeautifulSoup) -> bool:
@@ -112,21 +133,16 @@ def extract_primary_link(node) -> Optional[str]:
 # Estrazione anno robusta
 # ==============================
 def extract_year_from_text(txt: str) -> Optional[int]:
-    """
-    Cerca l'anno dando priorità a label chiare. Anni isolati sono deboli.
-    """
     if not txt:
         return None
     txt_norm = " " + re.sub(r"\s+", " ", txt) + " "
 
-    # 1) Mese/Anno affidabile
     m = DATE_PAT.search(txt_norm)
     if m:
         y = int(m.group(2))
         if YEAR_MIN <= y <= YEAR_MAX:
             return y
 
-    # 2) Anno vicino a label entro 16 char
     cands = []
     for m in YEAR_PAT.finditer(txt_norm):
         y = int(m.group(1))
@@ -136,17 +152,14 @@ def extract_year_from_text(txt: str) -> Optional[int]:
         window = txt_norm[max(0, i - 16): min(len(txt_norm), j + 16)]
         label = bool(LABEL_NEAR_PAT.search(window))
         neg = bool(NEG_CONTEXT_PAT.search(window))
-
         if label and not neg:
             extra = 1 if DATE_PAT.search(window) else 0
-            cands.append((y, 10 + extra))    # alto punteggio se label presente
+            cands.append((y, 10 + extra))
         elif not label:
-            cands.append((y, 1 if not neg else -5))  # anni isolati, punteggio basso
+            cands.append((y, 1 if not neg else -5))
 
     if not cands:
         return None
-
-    # Ordina per punteggio, a parità prendi l'anno più piccolo
     cands.sort(key=lambda t: (t[1], -t[0]))
     best_y, best_score = cands[-1]
     if best_score <= 1:
@@ -154,9 +167,6 @@ def extract_year_from_text(txt: str) -> Optional[int]:
     return best_y
 
 def parse_year_from_detail(url: str, headers: Dict[str, str]) -> Optional[int]:
-    """
-    Legge l'anno dal blocco specifiche dell'annuncio, non dall'intera pagina.
-    """
     try:
         s = fetch(url, headers)
     except Exception:
@@ -168,7 +178,6 @@ def parse_year_from_detail(url: str, headers: Dict[str, str]) -> Optional[int]:
 
     for box in containers:
         text = " " + re.sub(r"\s+", " ", box.get_text(" ", strip=True)) + " "
-
         m = re.search(
             r"(?:Anno|Immatricolazione|Immatricolata|Prima immatricolazione)[^\d]{0,12}(19\d{2}|20\d{2})",
             text, flags=re.IGNORECASE,
@@ -201,7 +210,7 @@ class ScrapeConfig:
     headers: Dict[str, str]
     brand: str
     model: str
-    verify_detail_year: bool = True  # opzione per precisione
+    verify_detail_year: bool = True
 
 def fetch(url: str, headers: Dict[str, str]) -> BeautifulSoup:
     r = requests.get(url, headers=headers, timeout=30)
@@ -248,7 +257,6 @@ def parse_page(url: str, headers: Dict[str, str], brand: str, model: str, verify
     for node in listing_blocks(soup):
         txt = text_clean(node.get_text(" ", strip=True))
 
-        # filtro blando per marca/modello, niente range anni
         if brand and brand.lower() not in txt.lower():
             continue
         if model and model.lower().replace(" ", "") not in txt.lower().replace(" ", ""):
@@ -265,14 +273,12 @@ def parse_page(url: str, headers: Dict[str, str], brand: str, model: str, verify
 
         href = extract_primary_link(node) or url
 
-        # Fallback: pagina dettaglio se manca l'anno
         if verify_detail_year and href and year is None:
             y2 = parse_year_from_detail(href, headers)
             if y2 is not None:
                 year = y2
                 year_source = "detail"
 
-        # Accettiamo solo se un anno è stato determinato
         if year is None:
             if log:
                 log("Saltato annuncio: anno non trovato su card e dettaglio")
@@ -282,7 +288,7 @@ def parse_page(url: str, headers: Dict[str, str], brand: str, model: str, verify
         loc = parse_location(txt)
 
         if log:
-            log(f"OK anno={year} [{year_source}]  prezzo={price}  url={href}")
+            log(f"OK anno={year} [{year_source}]  prezzo={price}  km={km}  loc={loc}  url={href}")
 
         items.append({
             "brand": brand or "",
@@ -313,7 +319,7 @@ def run_scrape(cfg: ScrapeConfig, progress_cb=None, log=None) -> pd.DataFrame:
     return df
 
 # ==============================
-# Report HTML
+# Report HTML (con MAPPA)
 # ==============================
 HTML_TEMPLATE = """<!doctype html>
 <html lang="it">
@@ -323,6 +329,7 @@ HTML_TEMPLATE = """<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <link rel="stylesheet" href="https://cdn.datatables.net/1.13.8/css/dataTables.bootstrap5.min.css">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
     body { padding: 20px; background: #0f1115; color: #e6e6e6; }
     a { color: #61dafb; }
@@ -332,6 +339,7 @@ HTML_TEMPLATE = """<!doctype html>
     .smallcaps { font-variant: all-small-caps; letter-spacing: .5px; }
     .table { color: #e6e6e6; }
     .table thead th { color:#c9d1d9; }
+    #map { height: 420px; border-radius: 12px; }
   </style>
 </head>
 <body>
@@ -365,6 +373,16 @@ HTML_TEMPLATE = """<!doctype html>
               </div>
             </div>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="row g-4 mt-1">
+      <div class="col-12">
+        <div class="card p-3">
+          <h5 class="mb-3">Mappa località annunci</h5>
+          <div id="map"></div>
+          <p class="muted mt-2">Geocoding via Nominatim (OpenStreetMap). I marker si caricano al volo dal browser.</p>
         </div>
       </div>
     </div>
@@ -413,11 +431,52 @@ HTML_TEMPLATE = """<!doctype html>
   <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
   <script src="https://cdn.datatables.net/1.13.8/js/jquery.dataTables.min.js"></script>
   <script src="https://cdn.datatables.net/1.13.8/js/dataTables.bootstrap5.min.js"></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
   $(function(){
     $('#ads-table').DataTable({ pageLength: 25, order: [[0, 'asc'], [1, 'asc']] });
     $('#stats-table').DataTable({ searching: false, paging: false, info: false, order: [[0, 'asc']] });
   });
+
+  // ====== MAPPA ======
+  const LOCATIONS = {{MAP_LOCATIONS_JSON}};
+  const map = L.map('map');
+  const tiles = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 18,
+    attribution: '&copy; OpenStreetMap'
+  }).addTo(map);
+
+  // geocoding con rate limit dolce
+  async function geocode(q) {
+    const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=it&q=' + encodeURIComponent(q);
+    const res = await fetch(url, { headers: { 'Accept-Language': 'it' }});
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!data || !data.length) return null;
+    return [parseFloat(data[0].lat), parseFloat(data[0].lon)];
+  }
+
+  (async function(){
+    const bounds = [];
+    for (let i=0; i<LOCATIONS.length; i++) {
+      const item = LOCATIONS[i];
+      try {
+        const p = await geocode(item.location);
+        if (!p) continue;
+        const marker = L.marker(p).addTo(map);
+        const links = item.items.map(it => `<div>• ${it.year} — €${it.price}${it.link ? ` — <a href="${it.link}" target="_blank" rel="noopener">apri</a>` : ''}</div>`).join('');
+        marker.bindPopup(`<b>${item.location}</b><br>${item.count} annuncio/i<br>${links}`);
+        bounds.push(p);
+      } catch(e) {}
+      // piccola pausa per essere gentili con Nominatim
+      await new Promise(r => setTimeout(r, 300));
+    }
+    if (bounds.length) {
+      map.fitBounds(bounds, { padding: [20,20] });
+    } else {
+      map.setView([41.9, 12.5], 5); // Italia
+    }
+  })();
   </script>
 </body>
 </html>
@@ -472,6 +531,29 @@ def make_line(stats_df: pd.DataFrame):
     )
     return plot(fig, include_plotlyjs=False, output_type="div")
 
+def build_locations_payload(df: pd.DataFrame) -> List[Dict]:
+    """
+    Aggrega per location e include un piccolo elenco di annunci per popup.
+    """
+    payload = []
+    if "location" not in df.columns:
+        return payload
+    grouped = df.groupby("location")
+    for loc, g in grouped:
+        items = []
+        for _, r in g.sort_values("price_eur").head(5).iterrows():
+            items.append({
+                "year": int(r["year"]),
+                "price": int(r["price_eur"]),
+                "link": r.get("source_url", "")
+            })
+        payload.append({
+            "location": loc,
+            "count": int(len(g)),
+            "items": items
+        })
+    return payload
+
 def generate_report(df: pd.DataFrame, brand: str, model: str, search_url: str, out_path: Path) -> None:
     stats = df.groupby("year")["price_eur"].agg(["count", "mean", "median", "min", "max"]).sort_index()
     min_year = int(stats["mean"].idxmin())
@@ -483,6 +565,9 @@ def generate_report(df: pd.DataFrame, brand: str, model: str, search_url: str, o
     line_div = make_line(stats)
     stats_tbody = render_table_rows_stats(stats)
     ads_tbody = render_table_rows_ads(df)
+
+    loc_payload = build_locations_payload(df)
+    loc_json = json.dumps(loc_payload, ensure_ascii=False)
 
     html = (
         HTML_TEMPLATE
@@ -497,6 +582,7 @@ def generate_report(df: pd.DataFrame, brand: str, model: str, search_url: str, o
         .replace("{{MAX_MEAN}}", f"{max_mean}")
         .replace("{{STATS_TBODY}}", stats_tbody)
         .replace("{{ADS_TBODY}}", ads_tbody)
+        .replace("{{MAP_LOCATIONS_JSON}}", loc_json)
     )
     out_path.write_text(html, encoding="utf-8")
 
@@ -527,7 +613,7 @@ class App(tk.Tk):
         self.report_path: Optional[Path] = None
         self.csv_path: Optional[Path] = None
 
-        self._user_outdir_modified = False  # se l’utente tocca la cartella, non auto-aggiorno più
+        self._user_outdir_modified = False
 
         s = ttk.Style()
         try:
@@ -564,11 +650,9 @@ class App(tk.Tk):
         self.url_var = tk.StringVar(value="")
         self.pages_var = tk.IntVar(value=12)
         self.delay_var = tk.DoubleVar(value=1.0)
-        # cartella default: Desktop/<modello>
         self.outdir_var = tk.StringVar(value=str(desktop_model_dir(self.model_var.get())))
         self.verify_detail_var = tk.BooleanVar(value=True)
 
-        # aggiorna cartella quando cambia modello, finché l'utente non la modifica manualmente
         def on_model_change(*_):
             if not self._user_outdir_modified:
                 self.outdir_var.set(str(desktop_model_dir(self.model_var.get())))
@@ -642,7 +726,7 @@ class App(tk.Tk):
     def open_help(self):
         win = tk.Toplevel(self)
         win.title("Guida rapida")
-        win.geometry("700x520")
+        win.geometry("700x540")
         txt = tk.Text(win, wrap="word", font=("Segoe UI", 10))
         txt.pack(fill="both", expand=True)
         guide = """
@@ -657,14 +741,13 @@ COME SI USA
 
 COSA PRODUCE
 
-- report_motoit.html: pagina interattiva con scatter Prezzo vs Anno, media per anno,
-  tabella annunci e statistiche.
+- report_motoit.html: scatter Prezzo vs Anno, media per anno, tabella annunci e mappa località.
 - annunci_motoit.csv: elenco completo degli annunci raccolti.
 
 ERRORI TIPICI E SOLUZIONI
 
 - "Nessun annuncio trovato":
-  • URL o filtro non restituisce risultati, oppure markup cambiato.
+  • URL o filtro che non restituisce risultati, oppure markup cambiato.
   • Prova a incollare direttamente l'URL di Moto.it della ricerca.
   • Riduci pagine max a 5 e riprova.
 
@@ -672,19 +755,20 @@ ERRORI TIPICI E SOLUZIONI
   • Rete lenta o blocco temporaneo del sito. Aumenta il ritardo nelle richieste.
   • Verifica di avere installato lxml:  pip install lxml
 
-- Anno errato in qualche annuncio:
-  • Tieni abilitato "Verifica anno su pagina dettaglio" per leggere le specifiche interne.
-  • Se l'annuncio ha più anni (garanzia, tagliando), il programma privilegia "Anno" o "Immatricolazione".
-  • Alza il ritardo a 1.0–1.2 s per evitare blocchi mentre apre il dettaglio.
+- Km sballati:
+  • Ora il parser prende solo il primo blocco numerico vicino a "Km" o prima di "km".
+  • Se un annuncio ha formati strani, controlla la riga nel CSV.
 
-- Report si apre ma grafici vuoti:
-  • Apri l'HTML con un browser moderno (Chrome, Edge, Firefox).
-  • Se usi estensioni restrittive, prova in incognito.
+- Anno errato:
+  • Tieni attivo "Verifica anno su pagina dettaglio".
+  • Se l'annuncio ha più anni (garanzia, tagliando), il programma privilegia "Anno" o "Immatricolazione".
+
+- Mappa vuota:
+  • Il geocoding usa Nominatim. Serve internet quando apri il report. Attendi qualche secondo.
 
 NOTE
 
 - Non esagerare con il numero di pagine. Mantieni un comportamento rispettoso verso il sito.
-- Gli anni non hanno range predefiniti: il report usa esattamente quelli trovati negli annunci.
         """.strip()
         txt.insert("1.0", guide)
         txt.configure(state="disabled")
